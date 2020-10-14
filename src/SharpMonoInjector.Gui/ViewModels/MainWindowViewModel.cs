@@ -28,6 +28,8 @@ namespace SharpMonoInjector.Gui.ViewModels
             InjectCommand = new RelayCommand(ExecuteInjectCommand, CanExecuteInjectCommand);
             EjectCommand = new RelayCommand(ExecuteEjectCommand, CanExecuteEjectCommand);
             CopyStatusCommand = new RelayCommand(ExecuteCopyStatusCommand);
+            InjectClassName = "Loader";
+            InjectMethodName = "Load";
         }
 
         private void ExecuteCopyStatusCommand(object parameter)

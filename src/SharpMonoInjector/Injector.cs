@@ -10,13 +10,15 @@ namespace SharpMonoInjector
 {
     public class Injector : IDisposable
     {
+        private const int ClearHeaderBytes = 0x240;
+
         private const string mono_get_root_domain = "mono_get_root_domain";
 
         private const string mono_thread_attach = "mono_thread_attach";
 
         private const string mono_image_open_from_data = "mono_image_open_from_data";
 
-        private const string mono_assembly_load_from_full = "mono_assembly_load_from_full";
+        private const string mono_assembly_load_from = "mono_assembly_load_from";
 
         private const string mono_assembly_get_image = "mono_assembly_get_image";
 
@@ -34,12 +36,15 @@ namespace SharpMonoInjector
 
         private const string mono_class_get_name = "mono_class_get_name";
 
+        private const string mono_assembly_invoke_load_hook = "mono_assembly_invoke_load_hook";
+
+
         private readonly Dictionary<string, IntPtr> Exports = new Dictionary<string, IntPtr>
         {
             { mono_get_root_domain, IntPtr.Zero },
             { mono_thread_attach, IntPtr.Zero },
             { mono_image_open_from_data, IntPtr.Zero },
-            { mono_assembly_load_from_full, IntPtr.Zero },
+            { mono_assembly_load_from, IntPtr.Zero },
             { mono_assembly_get_image, IntPtr.Zero },
             { mono_class_from_name, IntPtr.Zero },
             { mono_class_get_method_from_name, IntPtr.Zero },
@@ -47,7 +52,8 @@ namespace SharpMonoInjector
             { mono_assembly_close, IntPtr.Zero },
             { mono_image_strerror, IntPtr.Zero },
             { mono_object_get_class, IntPtr.Zero },
-            { mono_class_get_name, IntPtr.Zero }
+            { mono_class_get_name, IntPtr.Zero },
+            { mono_assembly_invoke_load_hook, IntPtr.Zero }
         };
 
         private Memory _memory;
@@ -144,14 +150,23 @@ namespace SharpMonoInjector
             if (methodName == null)
                 throw new ArgumentNullException(nameof(methodName));
 
-            IntPtr rawImage, assembly, image, @class, method;
+            IntPtr assembly, image, @class, method;
 
             ObtainMonoExports();
             _rootDomain = GetRootDomain();
-            rawImage = OpenImageFromData(rawAssembly);
+            image = OpenImageFromData(rawAssembly);
             _attach = true;
-            assembly = OpenAssemblyFromImage(rawImage);
-            image = GetImageFromAssembly(assembly);
+
+            IntPtr address = Exports[mono_assembly_invoke_load_hook];
+            address = Is64Bit ? (address + 17 + _memory.ReadInt(address + 13)) : new IntPtr(_memory.ReadInt(address + 6));
+            var bytes = _memory.ReadBytes(address, Is64Bit ? 8 : 4);
+
+            _memory.Write(address, new byte[bytes.Length]); // Dehook
+
+            assembly = LoadAssemblyFromImage(image);
+
+            _memory.Write(address, bytes); // Revert hook
+
             @class = GetClassFromName(image, @namespace, className);
             method = GetMethodFromName(@class, methodName);
             RuntimeInvoke(method);
@@ -197,8 +212,20 @@ namespace SharpMonoInjector
         private IntPtr OpenImageFromData(byte[] assembly)
         {
             IntPtr statusPtr = _memory.Allocate(4);
+
+            IntPtr addr = Native.VirtualAllocEx(_handle, IntPtr.Zero, assembly.Length,
+                    AllocationType.MEM_COMMIT, MemoryProtection.PAGE_READWRITE);
+
+            if (addr == IntPtr.Zero)
+                throw new InjectorException("Failed to allocate process memory", new Win32Exception(Marshal.GetLastWin32Error()));
+
+            _memory.Write(addr, assembly);
             IntPtr rawImage = Execute(Exports[mono_image_open_from_data],
-                _memory.AllocateAndWrite(assembly), (IntPtr)assembly.Length, (IntPtr)1, statusPtr);
+                addr,
+                (IntPtr)assembly.Length,
+                (IntPtr)0,
+                statusPtr
+                );
 
             MonoImageOpenStatus status = (MonoImageOpenStatus)_memory.ReadInt(statusPtr);
             
@@ -208,21 +235,23 @@ namespace SharpMonoInjector
                 throw new InjectorException($"{mono_image_open_from_data}() failed: {message}");
             }
 
+            _memory.Write(addr, new byte[ClearHeaderBytes]);
+
             return rawImage;
         }
 
-        private IntPtr OpenAssemblyFromImage(IntPtr image)
+        private IntPtr LoadAssemblyFromImage(IntPtr image)
         {
             IntPtr statusPtr = _memory.Allocate(4);
-            IntPtr assembly = Execute(Exports[mono_assembly_load_from_full],
-                image, _memory.AllocateAndWrite(new byte[1]), statusPtr, IntPtr.Zero);
+            IntPtr assembly = Execute(Exports[mono_assembly_load_from],
+                image, _memory.AllocateAndWrite(new byte[1]), statusPtr);
 
             MonoImageOpenStatus status = (MonoImageOpenStatus)_memory.ReadInt(statusPtr);
 
             if (status != MonoImageOpenStatus.MONO_IMAGE_OK) {
                 IntPtr messagePtr = Execute(Exports[mono_image_strerror], (IntPtr)status);
                 string message = _memory.ReadString(messagePtr, 256, Encoding.UTF8);
-                throw new InjectorException($"{mono_assembly_load_from_full}() failed: {message}");
+                throw new InjectorException($"{mono_assembly_load_from}() failed: {message}");
             }
 
             return assembly;
@@ -273,11 +302,13 @@ namespace SharpMonoInjector
             IntPtr result = Execute(Exports[mono_runtime_invoke],
                 method, IntPtr.Zero, IntPtr.Zero, excPtr);
 
-            IntPtr exc = (IntPtr)_memory.ReadInt(excPtr);
+            IntPtr exc = Is64Bit
+                ? (IntPtr)_memory.ReadLong(excPtr)
+                : (IntPtr)_memory.ReadInt(excPtr);
 
             if (exc != IntPtr.Zero) {
                 string className = GetClassName(exc);
-                string message = ReadMonoString((IntPtr)_memory.ReadInt(exc + (Is64Bit ? 0x20 : 0x10)));
+                string message = ReadMonoString(Is64Bit ? (IntPtr)_memory.ReadLong(exc + 0x18) : (IntPtr)_memory.ReadInt(exc + 0x10));
                 throw new InjectorException($"The managed method threw an exception: ({className}) {message}");
             }
         }
@@ -345,7 +376,7 @@ namespace SharpMonoInjector
             asm.MovEaxTo(retValPtr);
             asm.Return();
 
-            return asm.ToByteArray();
+            return asm.ToArray();
         }
 
         private byte[] Assemble64(IntPtr functionPtr, IntPtr retValPtr, IntPtr[] args)
@@ -384,7 +415,7 @@ namespace SharpMonoInjector
             asm.MovRaxTo(retValPtr);
             asm.Return();
 
-            return asm.ToByteArray();
+            return asm.ToArray();
         }
     }
 }
